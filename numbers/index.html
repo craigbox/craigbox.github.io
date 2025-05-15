@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <meta name="apple-mobile-web-app-title" content="Numbers">
+
+    <title>Number Flashcards (0-20) - PWA</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@900&display=swap" rel="stylesheet">
+    <style>
+        /* Basic reset and full height for html and body */
+        html, body {
+            height: 100%; /* Ensure html and body take full viewport height */
+            margin: 0;     /* Remove default browser margin */
+            font-family: 'Inter', sans-serif; /* Apply Inter font */
+            touch-action: manipulation; /* Improve touch responsiveness, disable double-tap zoom */
+            -webkit-tap-highlight-color: transparent; /* Remove tap highlight on mobile Safari */
+            overflow: hidden; /* Prevent accidental scrollbars */
+            background-color: #FEF3C7; /* bg-yellow-100 from Tailwind */
+        }
+
+        /* Custom class for the large, responsive number text */
+        .number-text-large {
+            /*
+             * Use vmin (viewport minimum) unit for font size.
+             * This makes the font size responsive to the smaller dimension of the viewport (height or width),
+             * ensuring the number is always large but fits well on any screen.
+             * 35vmin means 35% of the smaller viewport dimension.
+            */
+            font-size: 35vmin;
+            line-height: 1; /* Adjust line height to prevent extra vertical space with large fonts */
+        }
+    </style>
+</head>
+<body class="flex items-center justify-center cursor-pointer select-none">
+    <span id="numberText" class="number-text-large font-black text-gray-800">0</span>
+    <script>
+        // --- JavaScript Logic for the Flashcards ---
+
+        // Define the maximum number in the sequence (0 to 20 means 21 distinct numbers)
+        const maxNumber = 20;
+
+        // Get a reference to the HTML element where the number is displayed
+        const numberTextElement = document.getElementById('numberText');
+        // Get a reference to the body element to make the whole page clickable
+        const bodyElement = document.body;
+
+        // Function to display a random number
+        function showRandomNumber() {
+            // Generate a random integer between 0 and maxNumber (inclusive)
+            // Math.random() returns a float between 0 (inclusive) and 1 (exclusive)
+            // Multiply by (maxNumber + 1) to get a range from 0 to just under (maxNumber + 1)
+            // Math.floor() rounds down to the nearest whole number
+            const randomNumber = Math.floor(Math.random() * (maxNumber + 1));
+
+            // Update the text content of the number display element
+            numberTextElement.textContent = randomNumber;
+        }
+
+        // Add an event listener to the body element.
+        // This will call the showRandomNumber function when the body is clicked or tapped.
+        bodyElement.addEventListener('click', showRandomNumber);
+
+        // --- Initial setup ---
+        // Display a random number as soon as the page loads
+        showRandomNumber();
+
+        // --- End of JavaScript Logic ---
+    </script>
+
+</body>
+</html>
