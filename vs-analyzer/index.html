@@ -1,0 +1,463 @@
+import React, { useState, useEffect } from 'react';
+import { AlertTriangle, CheckCircle2, Info, XCircle, FileText, Search } from 'lucide-react';
+
+// js-yaml will be loaded from CDN in index.html or similar
+// For development, you might install it: npm install js-yaml
+// const jsyaml = window.jsyaml; // Assuming it's loaded globally
+
+const App = () => {
+    const [yamlInput, setYamlInput] = useState('');
+    const [analysisResults, setAnalysisResults] = useState([]);
+    const [jsYamlLoaded, setJsYamlLoaded] = useState(false);
+
+    useEffect(() => {
+        // Load js-yaml from CDN
+        const script = document.createElement('script');
+        script.src = 'https://cdnjs.cloudflare.com/ajax/libs/js-yaml/4.1.0/js-yaml.min.js';
+        script.async = true;
+        script.onload = () => {
+            console.log("js-yaml loaded successfully.");
+            setJsYamlLoaded(true);
+        };
+        script.onerror = () => {
+            console.error("Failed to load js-yaml.");
+            // Potentially set an error state to inform the user
+             setAnalysisResults([{
+                id: 'jsyaml-load-error',
+                level: 'error',
+                feature: 'Tool Error',
+                path: 'N/A',
+                message: 'Failed to load YAML parsing library (js-yaml). Please check your internet connection or adblockers and refresh.',
+            }]);
+        };
+        document.body.appendChild(script);
+
+        return () => {
+            document.body.removeChild(script);
+        };
+    }, []);
+
+    const analyzeVirtualService = (yamlString) => {
+        if (!window.jsyaml) {
+             return [{
+                id: 'jsyaml-not-ready',
+                level: 'error',
+                feature: 'Tool Error',
+                path: 'N/A',
+                message: 'YAML parsing library (js-yaml) is not yet loaded. Please wait a moment and try again.',
+            }];
+        }
+
+        const issues = [];
+        let vs;
+
+        try {
+            vs = window.jsyaml.load(yamlString);
+            if (!vs || typeof vs !== 'object' || vs.kind !== 'VirtualService' || !vs.spec) {
+                issues.push({ id: 'invalid-vs', level: 'error', feature: 'YAML Structure', path: 'N/A', message: 'Invalid or incomplete VirtualService YAML. Ensure it has kind: VirtualService and a spec.' });
+                return issues;
+            }
+        } catch (e) {
+            issues.push({ id: 'yaml-parse-error', level: 'error', feature: 'YAML Parsing', path: 'N/A', message: `YAML parsing error: ${e.message}` });
+            return issues;
+        }
+
+        const spec = vs.spec;
+
+        // HTTP Routes
+        spec.http?.forEach((httpRoute, httpIndex) => {
+            const httpRouteName = httpRoute.name || `(unnamed at index ${httpIndex})`;
+            const httpRoutePath = `spec.http[${httpIndex}] (${httpRouteName})`;
+
+            httpRoute.route?.forEach((routeDest, routeIndex) => {
+                if (routeDest.destination?.subset) {
+                    issues.push({
+                        id: `${httpRoutePath}.route[${routeIndex}].destination.subset`,
+                        level: 'warning',
+                        feature: 'HTTP Destination Subset',
+                        path: `${httpRoutePath}.route[${routeIndex}].destination.subset`,
+                        message: `Uses subset "${routeDest.destination.subset}" for host "${routeDest.destination.host}". Gateway API lacks a direct Istio subset concept. Consider using separate Kubernetes Services, or header/parameter-based routing for different backend versions/variants.`,
+                    });
+                }
+            });
+
+            if (httpRoute.fault) {
+                issues.push({
+                    id: `${httpRoutePath}.fault`,
+                    level: 'error',
+                    feature: 'HTTP Fault Injection',
+                    path: `${httpRoutePath}.fault`,
+                    message: 'Uses HTTP fault injection (delay/abort). Core Gateway API does not have standard fault injection filters. This functionality would likely require custom Gateway API filters (extensions) or be lost.',
+                });
+            }
+
+            if (httpRoute.retries) {
+                let retryMessage = 'Defines HTTP retries. Gateway API has an extended feature for retries (HTTPRouteRetry - KEP-1092), but its availability and richness (e.g., complex retryOn conditions, perTryTimeout) might differ from Istio\'s. ';
+                if (httpRoute.retries.retryOn) retryMessage += `Istio's retryOn: "${httpRoute.retries.retryOn}". `;
+                if (httpRoute.retries.perTryTimeout) retryMessage += `Istio's perTryTimeout: "${httpRoute.retries.perTryTimeout}". `;
+                issues.push({
+                    id: `${httpRoutePath}.retries`,
+                    level: 'warning',
+                    feature: 'HTTP Retries',
+                    path: `${httpRoutePath}.retries`,
+                    message: retryMessage.trim(),
+                });
+            }
+
+            httpRoute.match?.forEach((matchRule, matchIndex) => {
+                const matchRuleDesc = matchRule.name || `(unnamed at index ${matchIndex})`;
+                const matchPath = `${httpRoutePath}.match[${matchIndex}] (${matchRuleDesc})`;
+                if (matchRule.sourceLabels) {
+                    issues.push({
+                        id: `${matchPath}.sourceLabels`,
+                        level: 'error',
+                        feature: 'HTTP Match: sourceLabels',
+                        path: `${matchPath}.sourceLabels`,
+                        message: 'Uses "sourceLabels" for matching. Gateway API HTTPRouteMatch does not support matching on source workload labels.',
+                    });
+                }
+                if (matchRule.sourceNamespace) {
+                    issues.push({
+                        id: `${matchPath}.sourceNamespace`,
+                        level: 'warning',
+                        feature: 'HTTP Match: sourceNamespace',
+                        path: `${matchPath}.sourceNamespace`,
+                        message: 'Uses "sourceNamespace" for matching. This is Istio-specific and not directly available in Gateway API HTTPRouteMatch.',
+                    });
+                }
+                if (matchRule.port) {
+                    issues.push({
+                        id: `${matchPath}.port`,
+                        level: 'info',
+                        feature: 'HTTP Match: port',
+                        path: `${matchPath}.port`,
+                        message: `Matches on port ${matchRule.port}. In Gateway API, port matching for HTTP is typically handled by the Gateway listener, not within the HTTPRoute match criteria. Ensure listener configuration covers this.`,
+                    });
+                }
+                if (matchRule.uri?.regex && !matchRule.uri.prefix && !matchRule.uri.exact) {
+                    issues.push({
+                        id: `${matchPath}.uri.regex`,
+                        level: 'info',
+                        feature: 'HTTP Match: URI Regex',
+                        path: `${matchPath}.uri.regex`,
+                        message: `Uses URI regex matching ("${matchRule.uri.regex}"). Gateway API HTTPRoute supports PathMatchRegularExpression as an extended feature. Verify your Gateway API implementation supports this.`,
+                    });
+                }
+            });
+
+            if (httpRoute.delegate) {
+                issues.push({
+                    id: `${httpRoutePath}.delegate`,
+                    level: 'warning',
+                    feature: 'HTTP Route Delegate',
+                    path: `${httpRoutePath}.delegate`,
+                    message: `Uses "delegate" (name: ${httpRoute.delegate.name}, namespace: ${httpRoute.delegate.namespace}). Gateway API supports route delegation via 'parentRefs' on a Route referencing a Gateway. Review differences in trust model, namespacing, and how shared routing logic is structured.`,
+                });
+            }
+
+            if (httpRoute.corsPolicy) {
+                issues.push({
+                    id: `${httpRoutePath}.corsPolicy`,
+                    level: 'warning',
+                    feature: 'HTTP CorsPolicy',
+                    path: `${httpRoutePath}.corsPolicy`,
+                    message: 'Uses "corsPolicy". Gateway API does not have a standardized, rich CORS filter directly in HTTPRoute. This may require custom Gateway API filters, handling at the Gateway resource level (if supported by implementation), or at the backend service.',
+                });
+            }
+            
+            if (httpRoute.websocketUpgrade === true) {
+                issues.push({
+                    id: `${httpRoutePath}.websocketUpgrade`,
+                    level: 'info',
+                    feature: 'HTTP WebSocket Upgrade',
+                    path: `${httpRoutePath}.websocketUpgrade`,
+                    message: 'Explicitly enables "websocketUpgrade". Gateway API handles WebSockets. Ensure your Gateway implementation correctly routes WebSocket traffic, often inferred from headers (e.g., "Upgrade: websocket") or via specific listener/route configuration.',
+                });
+            }
+        });
+
+        spec.tcp?.forEach((tcpRoute, tcpIndex) => {
+            const tcpRouteName = tcpRoute.name || `(unnamed at index ${tcpIndex})`;
+            const tcpRoutePath = `spec.tcp[${tcpIndex}] (${tcpRouteName})`;
+            tcpRoute.route?.forEach((routeDest, routeIndex) => {
+                if (routeDest.destination?.subset) {
+                    issues.push({
+                        id: `${tcpRoutePath}.route[${routeIndex}].destination.subset`,
+                        level: 'warning',
+                        feature: 'TCP Destination Subset',
+                        path: `${tcpRoutePath}.route[${routeIndex}].destination.subset`,
+                        message: `Uses subset "${routeDest.destination.subset}" for TCP host "${routeDest.destination.host}". Gateway API lacks direct Istio subset concept for TCPRoute backends.`,
+                    });
+                }
+            });
+            tcpRoute.match?.forEach((matchRule, matchIndex) => {
+                const matchRuleDesc = `(match rule at index ${matchIndex})`;
+                const matchPath = `${tcpRoutePath}.match[${matchIndex}] ${matchRuleDesc}`;
+                if (matchRule.sourceLabels) {
+                    issues.push({
+                        id: `${matchPath}.sourceLabels`,
+                        level: 'error',
+                        feature: 'TCP Match: sourceLabels',
+                        path: `${matchPath}.sourceLabels`,
+                        message: 'Uses "sourceLabels" for TCP matching. Gateway API TCPRouteMatch does not support this.',
+                    });
+                }
+                if (matchRule.sourceSubnet) {
+                     issues.push({
+                        id: `${matchPath}.sourceSubnet`,
+                        level: 'warning',
+                        feature: 'TCP Match: sourceSubnet',
+                        path: `${matchPath}.sourceSubnet`,
+                        message: `Uses "sourceSubnet" (${matchRule.sourceSubnet}) for TCP matching. Gateway API TCPRoute does not have a standard field for this. Some implementations might offer sourceCIDR matching as an extension on the Gateway listener or route.`,
+                    });
+                }
+            });
+        });
+
+        spec.tls?.forEach((tlsRoute, tlsIndex) => {
+            const tlsRouteName = `(TLS route at index ${tlsIndex})`;
+            const tlsRoutePath = `spec.tls[${tlsIndex}] ${tlsRouteName}`;
+            tlsRoute.route?.forEach((routeDest, routeIndex) => {
+                if (routeDest.destination?.subset) {
+                    issues.push({
+                        id: `${tlsRoutePath}.route[${routeIndex}].destination.subset`,
+                        level: 'warning',
+                        feature: 'TLS Destination Subset',
+                        path: `${tlsRoutePath}.route[${routeIndex}].destination.subset`,
+                        message: `Uses subset "${routeDest.destination.subset}" for TLS route. Gateway API lacks direct Istio subset concept for TLSRoute backends.`,
+                    });
+                }
+            });
+            tlsRoute.match?.forEach((matchRule, matchIndex) => {
+                const matchRuleDesc = `(match rule at index ${matchIndex})`;
+                const matchPath = `${tlsRoutePath}.match[${matchIndex}] ${matchRuleDesc}`;
+                if (matchRule.sourceLabels) {
+                    issues.push({
+                        id: `${matchPath}.sourceLabels`,
+                        level: 'error',
+                        feature: 'TLS Match: sourceLabels',
+                        path: `${matchPath}.sourceLabels`,
+                        message: 'Uses "sourceLabels" for TLS matching. Gateway API TLSRouteMatch does not support this.',
+                    });
+                }
+            });
+        });
+        
+        if (spec.retryRemoteLocalities !== undefined) {
+            issues.push({
+                id: 'spec.retryRemoteLocalities',
+                level: 'error',
+                feature: 'retryRemoteLocalities',
+                path: 'spec.retryRemoteLocalities',
+                message: `Specifies "retryRemoteLocalities": ${spec.retryRemoteLocalities}. This is an Istio-specific feature for locality-aware load balancing/retries, with no direct Gateway API equivalent.`,
+            });
+        }
+
+        if (issues.length === 0) {
+            issues.push({ id: 'no-issues', level: 'success', feature: 'Analysis Complete', path: 'N/A', message: 'No major incompatibilities identified based on the checked features. Always manually review your VirtualService against your specific Gateway API implementation and its supported extended features.' });
+        }
+        
+        issues.sort((a, b) => {
+            const levelOrder = { error: 0, warning: 1, info: 2, success: 3 };
+            return levelOrder[a.level] - levelOrder[b.level];
+        });
+
+        return issues;
+    };
+
+    const handleAnalyze = () => {
+        if (!jsYamlLoaded) {
+            setAnalysisResults([{
+                id: 'jsyaml-not-ready-on-analyze',
+                level: 'error',
+                feature: 'Tool Error',
+                path: 'N/A',
+                message: 'YAML parsing library (js-yaml) is not yet loaded or failed to load. Please wait or check console for errors and refresh.',
+            }]);
+            return;
+        }
+        if (!yamlInput.trim()) {
+            setAnalysisResults([{
+                id: 'empty-input',
+                level: 'info',
+                feature: 'Input',
+                path: 'N/A',
+                message: 'Please paste your Istio VirtualService YAML into the text area.',
+            }]);
+            return;
+        }
+        const results = analyzeVirtualService(yamlInput);
+        setAnalysisResults(results);
+    };
+
+    const getIconForLevel = (level) => {
+        switch (level) {
+            case 'error': return <XCircle className="text-red-500 mr-3 flex-shrink-0" size={24} />;
+            case 'warning': return <AlertTriangle className="text-yellow-500 mr-3 flex-shrink-0" size={24} />;
+            case 'info': return <Info className="text-blue-500 mr-3 flex-shrink-0" size={24} />;
+            case 'success': return <CheckCircle2 className="text-green-500 mr-3 flex-shrink-0" size={24} />;
+            default: return <FileText className="text-gray-500 mr-3 flex-shrink-0" size={24} />;
+        }
+    };
+    
+    const exampleYaml = `apiVersion: networking.istio.io/v1alpha3
+kind: VirtualService
+metadata:
+  name: bookinfo-example
+spec:
+  hosts:
+  - reviews.prod.svc.cluster.local
+  http:
+  - name: "reviews-v2-traffic"
+    match:
+    - uri:
+        prefix: /reviews
+      sourceLabels:
+        app: productpage
+      port: 9080 
+    route:
+    - destination:
+        host: reviews.prod.svc.cluster.local
+        subset: v2
+      weight: 80
+    - destination:
+        host: reviews.prod.svc.cluster.local
+        subset: v3 # Another subset example
+      weight: 20
+    fault:
+      delay:
+        percentage:
+          value: 10.0
+        fixedDelay: 5s
+    retries:
+      attempts: 3
+      perTryTimeout: 2s
+      retryOn: connect-failure,refused-stream,503
+  - name: "ratings-delegate"
+    match:
+    - uri:
+        prefix: /ratings
+    delegate:
+      name: ratings-vs-delegate
+      namespace: bookinfo-delegates
+  - name: "productpage-rewrite-regex"
+    match:
+    - uri:
+        regex: "^/product/[0-9]+$"
+    rewrite:
+      uri: "/productpage" # Simple rewrite, regex was in match
+    route:
+    - destination:
+        host: productpage.prod.svc.cluster.local
+  - name: "websocket-route"
+    match:
+    - uri:
+        prefix: /socket
+    websocketUpgrade: true
+    route:
+    - destination:
+        host: websocket-server.prod.svc.cluster.local
+  tcp:
+  - name: "mysql-tcp-route"
+    match:
+    - port: 3306
+      sourceLabels: 
+        app: mysql-client
+    route:
+    - destination:
+        host: mysql-server.prod.svc.cluster.local
+        subset: v1 
+  tls:
+  - name: "secure-service-tls"
+    match:
+    - port: 443
+      sniHosts:
+      - my-secure-service.example.com
+      sourceLabels: 
+        security-group: internal-access
+    route:
+    - destination:
+        host: my-secure-backend.prod.svc.cluster.local
+        subset: secure 
+  retryRemoteLocalities: true`;
+
+    const loadExample = () => {
+        setYamlInput(exampleYaml);
+        setAnalysisResults([]); // Clear previous results
+    };
+
+    return (
+        <div className="min-h-screen bg-gradient-to-br from-slate-900 to-slate-800 text-slate-100 p-4 md:p-8 font-sans">
+            <div className="container mx-auto max-w-4xl">
+                <header className="text-center mb-8">
+                    <h1 className="text-4xl font-bold text-sky-400 mb-2">Istio VirtualService Analyzer</h1>
+                    <p className="text-slate-400 text-lg">Identify features potentially incompatible with Kubernetes Gateway API</p>
+                </header>
+
+                <div className="bg-slate-800 shadow-2xl rounded-xl p-6 md:p-8 mb-8">
+                    <label htmlFor="yamlInput" className="block text-sky-300 text-sm font-semibold mb-2">
+                        Paste your Istio VirtualService YAML here:
+                    </label>
+                    <textarea
+                        id="yamlInput"
+                        className="w-full h-64 p-4 bg-slate-900 border border-slate-700 rounded-lg text-slate-200 font-mono text-sm focus:ring-2 focus:ring-sky-500 focus:border-sky-500 transition-colors"
+                        value={yamlInput}
+                        onChange={(e) => setYamlInput(e.target.value)}
+                        placeholder="apiVersion: networking.istio.io/v1alpha3..."
+                    />
+                    <div className="mt-6 flex flex-col sm:flex-row gap-4">
+                        <button
+                            onClick={handleAnalyze}
+                            disabled={!jsYamlLoaded}
+                            className={`w-full sm:w-auto flex items-center justify-center px-8 py-3 bg-sky-600 hover:bg-sky-500 text-white font-semibold rounded-lg shadow-md transition-all duration-150 ease-in-out focus:outline-none focus:ring-2 focus:ring-sky-400 focus:ring-opacity-75 ${!jsYamlLoaded ? 'opacity-50 cursor-not-allowed' : ''}`}
+                        >
+                            <Search size={20} className="mr-2" /> Analyze
+                        </button>
+                         <button
+                            onClick={loadExample}
+                            className="w-full sm:w-auto flex items-center justify-center px-6 py-3 bg-slate-600 hover:bg-slate-500 text-slate-100 font-semibold rounded-lg shadow-md transition-all duration-150 ease-in-out focus:outline-none focus:ring-2 focus:ring-slate-400 focus:ring-opacity-75"
+                        >
+                            <FileText size={20} className="mr-2" /> Load Example
+                        </button>
+                    </div>
+                     {!jsYamlLoaded && (
+                        <p className="text-xs text-yellow-400 mt-3">YAML library loading... If this persists, check your connection or adblockers.</p>
+                    )}
+                </div>
+
+                {analysisResults.length > 0 && (
+                    <div className="bg-slate-800 shadow-2xl rounded-xl p-6 md:p-8">
+                        <h2 className="text-2xl font-semibold text-sky-300 mb-6">Analysis Results:</h2>
+                        <ul className="space-y-4">
+                            {analysisResults.map((result) => (
+                                <li key={result.id} className="flex items-start p-4 bg-slate-900/70 border border-slate-700 rounded-lg shadow">
+                                    {getIconForLevel(result.level)}
+                                    <div className="flex-grow">
+                                        <h3 className={`text-lg font-semibold ${
+                                            result.level === 'error' ? 'text-red-400' :
+                                            result.level === 'warning' ? 'text-yellow-400' :
+                                            result.level === 'info' ? 'text-blue-400' : 'text-green-400'
+                                        }`}>
+                                            {result.feature}
+                                        </h3>
+                                        <p className="text-sm text-slate-400 mt-1 mb-2 break-all">
+                                            <span className="font-medium text-slate-300">Path:</span> {result.path}
+                                        </p>
+                                        <p className="text-sm text-slate-300 leading-relaxed">{result.message}</p>
+                                    </div>
+                                </li>
+                            ))}
+                        </ul>
+                    </div>
+                )}
+            </div>
+            <footer className="text-center mt-12 py-4 text-sm text-slate-500">
+                <p>This tool provides a preliminary analysis. Always perform a thorough manual review when migrating configurations.</p>
+                <p>Kubernetes Gateway API is an evolving standard; consult its latest documentation for feature support.</p>
+            </footer>
+        </div>
+    );
+};
+
+export default App;
+
